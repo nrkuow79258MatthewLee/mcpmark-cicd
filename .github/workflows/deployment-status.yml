@@ -1,0 +1,374 @@
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  pre-deployment:
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.create_issue.outputs.issue_number }}
+      previous_commit: ${{ github.event.before }}
+      current_commit: ${{ github.sha }}
+      package_version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint checks
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Get package version
+        id: get_version
+        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Create deployment tracking issue
+        id: create_issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deployment Tracking - ${context.sha}`,
+              labels: ['deployment', 'in-progress'],
+              body: `
+              ## Deployment Tracking
+              - Previous Commit: ${{ github.event.before }}
+              - Current Commit: ${{ github.sha }}
+              - Package Version: ${{ steps.get_version.outputs.version }}
+              `
+            });
+            console.log('Created deployment issue #' + issue.number);
+            return issue.number;
+          result-encoding: string
+
+      - name: Post pre-deployment completion comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.create_issue.outputs.issue_number }},
+              body: "Pre-deployment checks completed"
+            });
+
+  rollback-preparation:
+    runs-on: ubuntu-latest
+    needs: pre-deployment
+    outputs:
+      artifact_name: ${{ steps.create_artifact.outputs.artifact_name }}
+      checksum: ${{ steps.generate_checksum.outputs.checksum }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create automated rollback script
+        run: |
+          cat > rollback.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          # Automated Rollback Script for Node.js Deployment
+          echo "=== Starting Rollback Process ==="
+
+          # Configuration
+          PREVIOUS_COMMIT="${{ needs.pre-deployment.outputs.previous_commit }}"
+          CURRENT_COMMIT="${{ needs.pre-deployment.outputs.current_commit }}"
+          PACKAGE_VERSION="${{ needs.pre-deployment.outputs.package_version }}"
+
+          echo "Rolling back from commit: $CURRENT_COMMIT"
+          echo "Target rollback commit: $PREVIOUS_COMMIT"
+
+          # Step 1: Verify Git repository state
+          if ! git rev-parse --verify $PREVIOUS_COMMIT > /dev/null 2>&1; then
+            echo "ERROR: Previous commit $PREVIOUS_COMMIT not found in repository"
+            exit 1
+          fi
+
+          # Step 2: Revert to previous commit
+          echo "1. Reverting to previous commit..."
+          git checkout $PREVIOUS_COMMIT
+
+          # Step 3: Restore configuration files
+          echo "2. Restoring configuration backups..."
+          if [ -f package.json.backup ]; then
+            cp package.json.backup package.json
+            echo "   ✅ Restored package.json"
+          fi
+          if [ -f package-lock.json.backup ]; then
+            cp package-lock.json.backup package-lock.json
+            echo "   ✅ Restored package-lock.json"
+          fi
+          if [ -f .env.example.backup ]; then
+            cp .env.example.backup .env.example
+            echo "   ✅ Restored environment template"
+          fi
+
+          # Step 4: Reinstall dependencies
+          echo "3. Reinstalling dependencies..."
+          npm ci
+
+          # Step 5: Verify rollback success
+          echo "4. Verifying rollback..."
+          FINAL_COMMIT=$(git rev-parse HEAD)
+          if [ "$FINAL_COMMIT" != "$PREVIOUS_COMMIT" ]; then
+            echo "ERROR: Rollback failed - current commit is $FINAL_COMMIT (expected $PREVIOUS_COMMIT)"
+            exit 1
+          fi
+
+          echo "=== Rollback Completed Successfully to $PREVIOUS_COMMIT ==="
+          EOF
+          chmod +x rollback.sh
+
+      - name: Create dependency verification script
+        run: |
+          cat > verify-deps.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          # Dependency Compatibility Verification Script
+          echo "=== Verifying Dependency Compatibility ==="
+
+          # Compare dependencies between current and previous commit
+          echo "1. Comparing dependency versions..."
+          PREVIOUS_DEPS=$(git show ${{ needs.pre-deployment.outputs.previous_commit }}:package.json | jq -r '.dependencies | to_entries | .[] | "\(.key):\(.value)"')
+          CURRENT_DEPS=$(cat package.json | jq -r '.dependencies | to_entries | .[] | "\(.key):\(.value)"')
+
+          DIFF=$(diff <(echo "$PREVIOUS_DEPS") <(echo "$CURRENT_DEPS") || true)
+          if [ -z "$DIFF" ]; then
+            echo "   ✅ Dependencies match previous commit"
+          else
+            echo "   ⚠️  Dependency differences detected:"
+            echo "$DIFF"
+          fi
+
+          # Verify npm install compatibility
+          echo "2. Testing npm install compatibility..."
+          npm ci --dry-run
+          echo "   ✅ npm install dry-run successful"
+
+          echo "=== Dependency Verification Complete ==="
+          EOF
+          chmod +x verify-deps.sh
+
+      - name: Backup configuration files
+        run: |
+          echo "Creating configuration backups..."
+          cp package.json package.json.backup
+          cp package-lock.json package-lock.json.backup
+          if [ -f .env.example ]; then
+            cp .env.example .env.example.backup
+          fi
+          echo "✅ Configuration backups created"
+
+      - name: Create rollback documentation
+        run: |
+          cat > ROLLBACK.md << 'EOF'
+          # Rollback Guide for Deployment ${{ needs.pre-deployment.outputs.current_commit }}
+
+          ## Overview
+          This guide provides step-by-step instructions to rollback the deployment from commit **${{ needs.pre-deployment.outputs.current_commit }}** to **${{ needs.pre-deployment.outputs.previous_commit }}**.
+
+          ## Prerequisites
+          - Git installed (version 2.20+)
+          - Node.js ${{ steps.setup-node.outputs.node-version }}
+          - npm/yarn installed
+          - Access to the repository
+          - Rollback package downloaded from GitHub Actions
+
+          ## Rollback Steps
+          1. **Extract Rollback Package**
+             ```bash
+             unzip rollback-package-${{ needs.pre-deployment.outputs.current_commit }}.zip
+             cd rollback-package-${{ needs.pre-deployment.outputs.current_commit }}
+             ```
+
+          2. **Run Automated Rollback Script**
+             ```bash
+             ./rollback.sh
+             ```
+
+          3. **Verify Rollback with Dependency Check**
+             ```bash
+             ./verify-deps.sh
+             ```
+
+          4. **Start Application**
+             ```bash
+             npm start
+             ```
+
+          5. **Verify Application Health**
+             - Check application logs
+             - Test core functionality
+             - Confirm all services are running
+
+          ## Emergency Manual Rollback
+          If the automated script fails, use these manual steps:
+          ```bash
+          # 1. Revert to previous commit
+          git checkout ${{ needs.pre-deployment.outputs.previous_commit }}
+
+          # 2. Restore configuration files
+          cp package.json.backup package.json
+          cp package-lock.json.backup package-lock.json
+
+          # 3. Reinstall dependencies
+          npm ci
+
+          # 4. Start application
+          npm start
+          ```
+
+          ## Rollback Artifacts Included
+          - `rollback.sh`: Automated rollback script with error handling
+          - `verify-deps.sh`: Dependency compatibility checker
+          - `package.json.backup`: Backup of package configuration
+          - `package-lock.json.backup`: Backup of dependency lockfile
+          - `.env.example.backup`: Backup of environment template (if present)
+          - `ROLLBACK.md`: This documentation
+          EOF
+
+      - name: Create rollback package
+        id: create_artifact
+        run: |
+          ARTIFACT_NAME="rollback-package-${{ needs.pre-deployment.outputs.current_commit }}"
+          mkdir -p "$ARTIFACT_NAME"
+          
+          # Copy all rollback artifacts
+          cp rollback.sh "$ARTIFACT_NAME/"
+          cp verify-deps.sh "$ARTIFACT_NAME/"
+          cp package.json.backup "$ARTIFACT_NAME/"
+          cp package-lock.json.backup "$ARTIFACT_NAME/"
+          [ -f .env.example.backup ] && cp .env.example.backup "$ARTIFACT_NAME/"
+          cp ROLLBACK.md "$ARTIFACT_NAME/"
+          
+          # Compress package
+          zip -r "$ARTIFACT_NAME.zip" "$ARTIFACT_NAME/"
+          
+          echo "artifact_name=$ARTIFACT_NAME.zip" >> $GITHUB_OUTPUT
+          echo "✅ Rollback package created: $ARTIFACT_NAME.zip"
+
+      - name: Generate SHA256 checksum
+        id: generate_checksum
+        run: |
+          CHECKSUM=$(sha256sum "${{ steps.create_artifact.outputs.artifact_name }}" | awk '{print $1}')
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          echo "✅ Generated checksum: $CHECKSUM"
+
+      - name: Upload rollback artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.create_artifact.outputs.artifact_name }}
+          path: ${{ steps.create_artifact.outputs.artifact_name }}
+          retention-days: 30
+
+      - name: Post rollback plan comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.pre-deployment.outputs.issue_number }},
+              body: `
+              ## 🔄 Rollback Plan Ready
+
+              - Previous Commit: ${{ needs.pre-deployment.outputs.previous_commit }}
+              - Current Commit: ${{ needs.pre-deployment.outputs.current_commit }}
+              - Package Version: ${{ needs.pre-deployment.outputs.package_version }}
+              - Artifact: ${{ steps.create_artifact.outputs.artifact_name }}
+
+              ✅ Automated rollback script created
+              ✅ Configuration files backed up
+              ✅ Dependency verification script created
+              ✅ Rollback documentation generated
+              ✅ Compressed rollback package created
+
+              ### Quick Rollback Command
+              \`\`\`bash
+              # Emergency quick rollback
+              git checkout ${{ needs.pre-deployment.outputs.previous_commit }} && cp package.json.backup package.json && cp package-lock.json.backup package-lock.json && npm ci && npm start
+              \`\`\`
+
+              - Rollback script created: true
+              - Configuration backup: true
+              - SHA256: ${{ steps.generate_checksum.outputs.checksum }}
+              `
+            });
+
+  post-deployment:
+    runs-on: ubuntu-latest
+    needs: rollback-preparation
+    steps:
+      - name: Update deployment issue labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Remove in-progress label
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.pre-deployment.outputs.issue_number }},
+              name: 'in-progress'
+            });
+            
+            // Add completed label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.pre-deployment.outputs.issue_number }},
+              labels: ['completed']
+            });
+
+      - name: Post final deployment comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.pre-deployment.outputs.issue_number }},
+              body: `
+              ## Deployment Completed Successfully
+
+              ### Rollback Artifact Details
+              - Artifact Name: ${{ needs.rollback-preparation.outputs.artifact_name }}
+              - SHA256 Checksum: ${{ needs.rollback-preparation.outputs.checksum }}
+              - Retention Period: 30 days
+
+              The deployment tracking issue will now be closed. For rollback instructions, refer to the attached artifact.
+              `
+            });
+
+      - name: Close deployment tracking issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.pre-deployment.outputs.issue_number }},
+              state: 'closed'
+            });
